@@ -9,6 +9,10 @@ import {
   marcarDesconectado,
   todosDesconectados,
   calcularEquipos,
+  cambiarEquipo,
+  puedeComenzar,
+  quitarJugador,
+  contarEquipo,
 } from '../room.js';
 
 // ── validarModo ───────────────────────────────────────────────────────────────
@@ -190,6 +194,13 @@ describe('agregarJugador', () => {
       .toThrow('sala_llena');
   });
 
+  it('lanza error si la MISMA cuenta intenta unirse a su propia sala', () => {
+    // uid-A ya es el creador; no puede volver a unirse (probar 1v1 contra sí mismo).
+    expect(() => agregarJugador(sala, 'uid-A', 'JugadorA', 'socket-otra'))
+      .toThrow('ya_estas_en_la_sala');
+    expect(sala.jugadores).toHaveLength(1);
+  });
+
   it('no modifica la sala si lanza error', () => {
     agregarJugador(sala, 'uid-B', 'JugadorB', 'socket-2');
     try { agregarJugador(sala, 'uid-C', 'JugadorC', 'socket-3'); } catch {}
@@ -287,5 +298,101 @@ describe('calcularEquipos', () => {
     const equipos = calcularEquipos(sala);
     expect(equipos.A).toHaveLength(2);
     expect(equipos.B).toHaveLength(2);
+  });
+});
+
+// ── Lobby: host, cambiar equipo, comenzar, salir ──────────────────────────────
+
+describe('crearSala — anfitrión', () => {
+  it('el creador queda como hostId', () => {
+    const s = crearSala('111111', '2v2', 'p1', 'Ana', 'sock1');
+    expect(s.hostId).toBe('p1');
+    expect(s.fase).toBe('LOBBY');
+  });
+});
+
+describe('cambiarEquipo', () => {
+  const sala2v2 = () => {
+    const s = crearSala('222222', '2v2', 'p1', 'Ana', 's1');   // A
+    agregarJugador(s, 'p2', 'Beto', 's2');                     // B (balanceo)
+    agregarJugador(s, 'p3', 'Cami', 's3');                     // A
+    agregarJugador(s, 'p4', 'Dani', 's4');                     // B
+    return s;
+  };
+
+  it('mueve al jugador al equipo pedido si hay cupo', () => {
+    const s = crearSala('222222', '2v2', 'p1', 'Ana', 's1'); // A
+    agregarJugador(s, 'p2', 'Beto', 's2');                   // B
+    cambiarEquipo(s, 'p2', 'A');
+    expect(s.jugadores.find((j) => j.id === 'p2').equipo).toBe('A');
+  });
+
+  it('rechaza si el equipo destino está lleno (2v2: máx 2)', () => {
+    const s = sala2v2(); // A: p1,p3  B: p2,p4
+    expect(() => cambiarEquipo(s, 'p2', 'A')).toThrow('equipo_lleno');
+  });
+
+  it('con el equipo lleno permite INTERCAMBIAR con un jugador de ese equipo', () => {
+    const s = sala2v2(); // A: p1,p3  B: p2,p4
+    cambiarEquipo(s, 'p2', 'A', 'p3'); // p2 (B) intercambia con p3 (A)
+    expect(s.jugadores.find((j) => j.id === 'p2').equipo).toBe('A');
+    expect(s.jugadores.find((j) => j.id === 'p3').equipo).toBe('B');
+    // los otros dos no se tocan
+    expect(s.jugadores.find((j) => j.id === 'p1').equipo).toBe('A');
+    expect(s.jugadores.find((j) => j.id === 'p4').equipo).toBe('B');
+  });
+
+  it('rechaza el intercambio si swapCon no pertenece al equipo destino', () => {
+    const s = sala2v2(); // A: p1,p3  B: p2,p4
+    expect(() => cambiarEquipo(s, 'p2', 'A', 'p4')).toThrow('equipo_lleno'); // p4 es de B
+  });
+
+  it('rechaza fuera del lobby', () => {
+    const s = sala2v2();
+    s.fase = 'TURNOS';
+    expect(() => cambiarEquipo(s, 'p2', 'A')).toThrow('partida_en_curso');
+  });
+
+  it('rechaza equipo inválido', () => {
+    const s = sala2v2();
+    expect(() => cambiarEquipo(s, 'p2', 'Z')).toThrow('equipo_invalido');
+  });
+});
+
+describe('puedeComenzar', () => {
+  it('falso si la sala no está llena', () => {
+    const s = crearSala('333333', '2v2', 'p1', 'Ana', 's1');
+    expect(puedeComenzar(s)).toBe(false);
+  });
+
+  it('verdadero en 2v2 con 2 y 2', () => {
+    const s = crearSala('333333', '2v2', 'p1', 'Ana', 's1');
+    agregarJugador(s, 'p2', 'B', 's2');
+    agregarJugador(s, 'p3', 'C', 's3');
+    agregarJugador(s, 'p4', 'D', 's4');
+    expect(contarEquipo(s, 'A')).toBe(2);
+    expect(contarEquipo(s, 'B')).toBe(2);
+    expect(puedeComenzar(s)).toBe(true);
+  });
+
+  it('verdadero en 1v1 con 1 y 1', () => {
+    const s = crearSala('333333', '1v1', 'p1', 'Ana', 's1');
+    agregarJugador(s, 'p2', 'B', 's2');
+    expect(puedeComenzar(s)).toBe(true);
+  });
+});
+
+describe('quitarJugador', () => {
+  it('saca al jugador y reasigna el anfitrión si era el host', () => {
+    const s = crearSala('444444', '2v2', 'p1', 'Ana', 's1');
+    agregarJugador(s, 'p2', 'Beto', 's2');
+    expect(quitarJugador(s, 'p1')).toBe(true);
+    expect(s.jugadores.some((j) => j.id === 'p1')).toBe(false);
+    expect(s.hostId).toBe('p2'); // el rol pasó al siguiente
+  });
+
+  it('devuelve false si el jugador no estaba', () => {
+    const s = crearSala('444444', '1v1', 'p1', 'Ana', 's1');
+    expect(quitarJugador(s, 'nadie')).toBe(false);
   });
 });
