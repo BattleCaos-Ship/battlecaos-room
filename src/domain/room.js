@@ -13,11 +13,18 @@ export function generarCodigo() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
-export function crearSala(codigo, modo, playerId, name, socketId) {
+// Nombre visible de la sala (el CÓDIGO de 6 dígitos actúa como "contraseña" para unirse).
+export function normalizarNombreSala(nombre, fallback = 'Sala de batalla') {
+  const n = typeof nombre === 'string' ? nombre.trim().slice(0, 30) : '';
+  return n.length >= 1 ? n : fallback;
+}
+
+export function crearSala(codigo, modo, playerId, name, socketId, nombreSala = null) {
   validarModo(modo);
   return {
     codigo,
     modo,
+    nombre:    normalizarNombreSala(nombreSala, `Sala de ${name ?? 'batalla'}`),
     fase:      'LOBBY',
     hostId:    playerId, // el creador es el anfitrión (quien puede comenzar la partida)
     jugadores: [{ id: playerId, name, socketId, equipo: 'A', conectado: true, desconectadoEn: null }],
@@ -50,15 +57,22 @@ export function agregarJugador(sala, playerId, name, socketId) {
   return equipo;
 }
 
-// El jugador elige bando en el lobby de 2v2 (o cambia de lado en 1v1). Solo antes de empezar
-// y si el equipo destino no está lleno.
-export function cambiarEquipo(sala, playerId, equipo) {
+// El jugador elige bando en el lobby de 2v2 (o cambia de lado en 1v1). Solo antes de empezar.
+// Si el equipo destino está LLENO, aún puede entrar INTERCAMBIANDO lugar con un jugador de
+// ese equipo (`swapConId`) — sin esto, con la sala llena nadie podía reorganizar los bandos.
+export function cambiarEquipo(sala, playerId, equipo, swapConId = null) {
   if (sala.fase !== 'LOBBY') throw new Error('partida_en_curso');
   if (equipo !== 'A' && equipo !== 'B') throw new Error('equipo_invalido');
   const jugador = sala.jugadores.find((j) => j.id === playerId);
   if (!jugador) throw new Error('jugador_no_esta');
   if (jugador.equipo === equipo) return jugador; // ya está ahí, no-op
-  if (contarEquipo(sala, equipo) >= maxPorEquipo(sala.modo)) throw new Error('equipo_lleno');
+  if (contarEquipo(sala, equipo) >= maxPorEquipo(sala.modo)) {
+    const otro = swapConId ? sala.jugadores.find((j) => j.id === swapConId) : null;
+    if (!otro || otro.equipo !== equipo) throw new Error('equipo_lleno');
+    otro.equipo = jugador.equipo; // intercambio: cada uno toma el bando del otro
+    jugador.equipo = equipo;
+    return jugador;
+  }
   jugador.equipo = equipo;
   return jugador;
 }

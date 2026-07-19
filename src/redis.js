@@ -37,18 +37,25 @@ export function esErrorDeConexion(err) {
   if (!err) return false;
   if (err.name === 'MaxRetriesPerRequestError') return true;
   const m = String(err.message || err);
-  return /ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EPIPE|EHOSTUNREACH|Connection is closed|Command timed out|Stream isn't writeable|Reached the max retries|failed to refresh|Connection is broken/i.test(m);
+  // Además de errores de RED, cuentan como "nodo inutilizable" los errores de CUOTA/CAPACIDAD:
+  //   - "max requests limit exceeded": Upstash free tier agotó su cuota → el nodo rechaza TODO.
+  //   - "OOM command not allowed": Redis sin memoria → no acepta escrituras.
+  // Sin esto (hallazgo del chaos test): la réplica en segundo plano se tragaba el error de cuota
+  // en silencio → salud.s seguía en true, el respaldo DIVERGÍA sin que nadie lo supiera, y un
+  // failover habría servido estado VIEJO. Y si la cuota la agotaba el primario, la operación
+  // fallaba hacia el caller en vez de conmutar al respaldo sano.
+  return /ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EPIPE|EHOSTUNREACH|Connection is closed|Command timed out|Stream isn't writeable|Reached the max retries|failed to refresh|Connection is broken|max requests limit|OOM command not allowed/i.test(m);
 }
 
 // Envuelve dos clientes ioredis (primario, respaldo) en un cliente con doble escritura y
 // failover. Exportado para poder testear la lógica con clientes simulados.
-export function makeResilient(primary, secondary, { healthMs = 3000 } = {}) {
-  const salud = { p: true, s: true };
+export function makeResilient(primary, secondary, { healthMs = 3000, replica = null } = {}) {
+  const salud = { p: true, s: true, r: !!replica };
 
   const marcar = (nodo, ok, err) => {
     if (salud[nodo] === ok) return;
     salud[nodo] = ok;
-    const cual = nodo === 'p' ? 'PRIMARIO' : 'RESPALDO';
+    const cual = nodo === 'p' ? 'PRIMARIO' : nodo === 's' ? 'RESPALDO' : 'RÉPLICA-LECTURA';
     if (ok) log.info(`redis ${cual} recuperado.`);
     else    log.warn(`redis ${cual} caído → operando con el otro nodo. (${err?.message ?? err})`);
   };
@@ -57,12 +64,19 @@ export function makeResilient(primary, secondary, { healthMs = 3000 } = {}) {
   const timer = setInterval(async () => {
     try { await primary.ping();   marcar('p', true); } catch { /* sigue caído */ }
     try { await secondary.ping(); marcar('s', true); } catch { /* sigue caído */ }
+    if (replica) { try { await replica.ping(); marcar('r', true); } catch { /* sigue caído */ } }
   }, healthMs);
   timer.unref?.();
 
-  // LECTURA: nodo preferido primero (primario si está sano); ante error de conexión, el otro.
+  // LECTURA: si hay RÉPLICA de lectura sana, se prefiere para descargar al primario; si no, el
+  // primario y luego el respaldo. ⚠️ La réplica es ASÍNCRONA (puede ir con lag) → NUNCA activarla
+  // en servicios con read-modify-write (game: leer sala → mutar → escribir), romperían el
+  // "read-your-writes". Se habilita por REDIS_READ_REPLICA_URL solo en servicios tolerantes a
+  // datos ligeramente viejos (p.ej. lecturas de KPIs/dashboards). Ante error, cae al primario.
   async function read(cmd, args) {
-    const orden = salud.p ? [['p', primary], ['s', secondary]] : [['s', secondary], ['p', primary]];
+    const orden = [];
+    if (replica && salud.r) orden.push(['r', replica]);
+    orden.push(...(salud.p ? [['p', primary], ['s', secondary]] : [['s', secondary], ['p', primary]]));
     let ultimoErr;
     for (const [nodo, cli] of orden) {
       try { const r = await cli[cmd](...args); marcar(nodo, true); return r; }
@@ -72,7 +86,7 @@ export function makeResilient(primary, secondary, { healthMs = 3000 } = {}) {
         else throw err; // error real (no de conexión) → no reintentar en el otro nodo
       }
     }
-    throw ultimoErr; // ambos nodos caídos
+    throw ultimoErr; // todos los nodos caídos
   }
 
   // Replica un comando al secundario en SEGUNDO PLANO (no bloquea la ruta caliente).
@@ -136,18 +150,29 @@ export function makeResilient(primary, secondary, { healthMs = 3000 } = {}) {
     return wrap;
   }
 
+  // Salud de AMBOS nodos, medida en el momento (para /health y la métrica redis_node_up).
+  async function health() {
+    let p = false, s = false;
+    try { await primary.ping();   p = true; } catch { /* caído */ }
+    try { await secondary.ping(); s = true; } catch { /* caído */ }
+    marcar('p', p); marcar('s', s);
+    return { primary: p, secondary: s };
+  }
+
   return new Proxy({}, {
     get(_t, prop) {
       if (prop === 'pipeline' || prop === 'multi') return pipeline;
+      if (prop === 'health') return health;
       if (prop === 'connect') {
         return async () => {
           const r = await Promise.allSettled([primary.connect(), secondary.connect()]);
           if (r[0].status === 'rejected') marcar('p', false, r[0].reason);
           if (r[1].status === 'rejected') marcar('s', false, r[1].reason);
+          if (replica) { try { await replica.connect(); } catch (e) { marcar('r', false, e); } }
         };
       }
       if (prop === 'quit' || prop === 'disconnect') {
-        return async () => { clearInterval(timer); await Promise.allSettled([primary[prop]?.(), secondary[prop]?.()]); };
+        return async () => { clearInterval(timer); await Promise.allSettled([primary[prop]?.(), secondary[prop]?.(), replica?.[prop]?.()]); };
       }
       if (typeof prop === 'string') {
         if (WRITE_CMDS.has(prop)) return (...args) => write(prop, args);
@@ -168,6 +193,11 @@ export function createRedis() {
     const client = new Redis(process.env.REDIS_URL, OPTS_SIMPLE);
     client.on('connect', () => log.info('redis conectado'));
     client.on('error',   (err) => log.error('redis error:', err.message));
+    // health() uniforme también en modo simple (solo nodo primario).
+    client.health = async () => {
+      try { await client.ping(); return { primary: true, secondary: null }; }
+      catch { return { primary: false, secondary: null }; }
+    };
     return client;
   }
 
@@ -178,6 +208,19 @@ export function createRedis() {
   primary.on('error',     (err) => log.error('redis error (primario):', err.message));
   secondary.on('connect', () => log.info('redis conectado (respaldo)'));
   secondary.on('error',   (err) => log.error('redis error (respaldo):', err.message));
+
+  // RÉPLICA de lectura (opt-in): descarga las lecturas tolerantes a lag del primario. Solo se
+  // activa si REDIS_READ_REPLICA_URL está definida — y solo debe activarse en servicios SIN
+  // read-modify-write (ver read() y deploy/REPLICACION.md). Por defecto: no existe (sin cambios).
+  const replicaUrl = process.env.REDIS_READ_REPLICA_URL;
+  let replica = null;
+  if (replicaUrl) {
+    replica = new Redis(replicaUrl, OPTS_RESILIENTE);
+    replica.on('connect', () => log.info('redis conectado (réplica-lectura)'));
+    replica.on('error',   (err) => log.error('redis error (réplica-lectura):', err.message));
+    log.info('redis con RÉPLICA DE LECTURA activa (lecturas tolerantes a lag → réplica)');
+  }
+
   log.info('redis en modo RESILIENTE (primario + respaldo, doble escritura)');
-  return makeResilient(primary, secondary);
+  return makeResilient(primary, secondary, { replica });
 }

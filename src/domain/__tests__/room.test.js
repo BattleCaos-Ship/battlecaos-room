@@ -332,6 +332,21 @@ describe('cambiarEquipo', () => {
     expect(() => cambiarEquipo(s, 'p2', 'A')).toThrow('equipo_lleno');
   });
 
+  it('con el equipo lleno permite INTERCAMBIAR con un jugador de ese equipo', () => {
+    const s = sala2v2(); // A: p1,p3  B: p2,p4
+    cambiarEquipo(s, 'p2', 'A', 'p3'); // p2 (B) intercambia con p3 (A)
+    expect(s.jugadores.find((j) => j.id === 'p2').equipo).toBe('A');
+    expect(s.jugadores.find((j) => j.id === 'p3').equipo).toBe('B');
+    // los otros dos no se tocan
+    expect(s.jugadores.find((j) => j.id === 'p1').equipo).toBe('A');
+    expect(s.jugadores.find((j) => j.id === 'p4').equipo).toBe('B');
+  });
+
+  it('rechaza el intercambio si swapCon no pertenece al equipo destino', () => {
+    const s = sala2v2(); // A: p1,p3  B: p2,p4
+    expect(() => cambiarEquipo(s, 'p2', 'A', 'p4')).toThrow('equipo_lleno'); // p4 es de B
+  });
+
   it('rechaza fuera del lobby', () => {
     const s = sala2v2();
     s.fase = 'TURNOS';
